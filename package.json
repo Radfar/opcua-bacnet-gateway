@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "node-bacnet": "^0.2.4"
+  }
+}
