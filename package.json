@@ -1,5 +1,7 @@
 {
   "dependencies": {
+    "@bacnet-js/device": "^0.8.0",
+    "bacnet-device": "^0.0.4",
     "node-bacnet": "^0.2.4"
   }
 }
