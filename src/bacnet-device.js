@@ -1,5 +1,6 @@
 const Bacnet = require('node-bacnet');
 const { mockBACnetDatabase, DEVICE_INSTANCE } = require('./device-object');
+const { startOpcua, zone3 } = require('./opcua-client');
 
 const DEVICE_VENDOR_ID = 999;
 
@@ -8,15 +9,15 @@ const client = new Bacnet({ port: 47808, interface: '0.0.0.0' });
 console.log('BACnet/IP Native Client-Server Stack Initialized');
 console.log(`Exposing Device Instance: ${DEVICE_INSTANCE} on UDP Port 47808`);
 
-// --- Discovery (documented, already working) ---
+// --- Discovery ---
 client.on('whoIs', (data) => {
   console.log(`[Discovery] Who-Is request caught from: ${data.header.sender.address}`);
   client.iAmResponse(data.header.sender, DEVICE_INSTANCE, Bacnet.enum.Segmentation.NO_SEGMENTATION, DEVICE_VENDOR_ID);
 });
 
-// --- ReadProperty: confirmed real event name is "readProperty" (not "request") ---
+// --- ReadProperty ---
 client.on('readProperty', (data) => {
-  const { objectId, property } = data.payload; // {type, instance}, {id, index}
+  const { objectId, property } = data.payload;
   console.log(`[ReadProperty] type=${objectId.type} instance=${objectId.instance} prop=${property.id}`);
 
   const objType = mockBACnetDatabase[objectId.type];
@@ -24,7 +25,6 @@ client.on('readProperty', (data) => {
   const value = obj ? obj[property.id] : null;
 
   if (value) {
-    // readPropertyResponse needs the WHOLE property object ({id, index}), not just property.id
     client.readPropertyResponse(data.header.sender, data.invokeId, objectId, property, value);
   } else {
     client.errorResponse(
@@ -36,21 +36,20 @@ client.on('readProperty', (data) => {
   }
 });
 
-// --- WriteProperty: same fix, real event is "writeProperty" ---
+// --- WriteProperty (not wired back to OPC UA yet — TODO once reads are proven stable) ---
 client.on('writeProperty', (data) => {
-  const { objectId, property, value } = data.payload; // value is an array of tagged values, e.g. [{type, value}]
+  const { objectId, property, value } = data.payload;
   console.log(`[WriteProperty] type=${objectId.type} instance=${objectId.instance} prop=${property.id}`);
 
   const objType = mockBACnetDatabase[objectId.type];
   const obj = objType ? objType[objectId.instance] : null;
 
   if (obj && obj[property.id] && value && value.length) {
-    obj[property.id] = value; // store as-is (already tagged) so future reads stay consistent
+    obj[property.id] = value;
     console.log(`  -> new value: ${JSON.stringify(value[0].value)}`);
-    // simpleAckResponse's 2nd arg is the SERVICE ENUM, not anything off the request
     client.simpleAckResponse(data.header.sender, Bacnet.enum.ConfirmedServiceChoice.WRITE_PROPERTY, data.invokeId);
-    // TODO once this is proven stable: push this write back into your OPC UA client
-    // so a BACnet-side write actually reaches CODESYS, not just this mock store.
+    // TODO: push this write back into OPC UA via session.write(), same pattern as
+    // the web-SCADA project's writeBool(), once reads are proven stable end-to-end.
   } else {
     client.errorResponse(
       data.header.sender,
@@ -61,10 +60,22 @@ client.on('writeProperty', (data) => {
   }
 });
 
-// --- Mock telemetry loop: stand-in for the eventual OPC UA poll ---
-setInterval(() => {
-  const ai1 = mockBACnetDatabase[Bacnet.enum.ObjectType.ANALOG_INPUT][1];
-  const presentValue = ai1[Bacnet.enum.PropertyIdentifier.PRESENT_VALUE][0];
-  presentValue.value = parseFloat((presentValue.value + (Math.random() - 0.4)).toFixed(2));
-  console.log(`[Mock Telemetry] AI_1 -> ${presentValue.value}`);
-}, 3000);
+// --- Push live Zone 03 OPC UA values into the BACnet object store ---
+function syncFromOpcua() {
+  if (!zone3.connected) return; // keep last-known-good values rather than overwriting with null
+
+  const ai = mockBACnetDatabase[Bacnet.enum.ObjectType.ANALOG_INPUT];
+  const bv = mockBACnetDatabase[Bacnet.enum.ObjectType.BINARY_VALUE];
+
+  if (zone3.FLOW !== null) ai[1][Bacnet.enum.PropertyIdentifier.PRESENT_VALUE][0].value = zone3.FLOW;
+  if (zone3.MOISTURE !== null) ai[2][Bacnet.enum.PropertyIdentifier.PRESENT_VALUE][0].value = zone3.MOISTURE;
+  if (zone3.VALVE !== null) bv[1][Bacnet.enum.PropertyIdentifier.PRESENT_VALUE][0].value = zone3.VALVE ? 1 : 0;
+  if (zone3.FAULT !== null) bv[2][Bacnet.enum.PropertyIdentifier.PRESENT_VALUE][0].value = zone3.FAULT ? 1 : 0;
+
+  console.log(`[Zone 03 -> BACnet] flow=${zone3.FLOW} moisture=${zone3.MOISTURE} valve=${zone3.VALVE} fault=${zone3.FAULT}`);
+}
+setInterval(syncFromOpcua, 1000);
+
+startOpcua().catch((err) => {
+  console.error('Failed to start OPC UA client:', err.message);
+});
