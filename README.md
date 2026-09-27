@@ -1,1 +1,2 @@
 OPC UA client working; BACnet server-side ReadProperty/WriteProperty handling is unverified, node-bacnet's own docs mark this Beta/undocumented
+live OPC UA data confirmed flowing through real BACnet ReadProperty, verified from a separate machine — not "in progress" anymore for the read path.
