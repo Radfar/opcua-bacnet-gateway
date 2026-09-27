@@ -8,6 +8,7 @@ const objectList = [
   { type: bacnet.enum.ObjectType.ANALOG_INPUT, instance: 2 },
   { type: bacnet.enum.ObjectType.BINARY_VALUE, instance: 1 },
   { type: bacnet.enum.ObjectType.BINARY_VALUE, instance: 2 },
+  { type: bacnet.enum.ObjectType.BINARY_OUTPUT, instance: 1 },
 ];
 
 const mockBACnetDatabase = {
@@ -54,6 +55,15 @@ const mockBACnetDatabase = {
     },
     2: {
       [bacnet.enum.PropertyIdentifier.OBJECT_NAME]: [{ value: 'Zone3_Fault', type: bacnet.enum.ApplicationTag.CHARACTER_STRING }],
+      [bacnet.enum.PropertyIdentifier.PRESENT_VALUE]: [{ value: 0, type: bacnet.enum.ApplicationTag.ENUMERATED }],
+    },
+  },
+  [bacnet.enum.ObjectType.BINARY_OUTPUT]: {
+    1: {
+      [bacnet.enum.PropertyIdentifier.OBJECT_NAME]: [{ value: 'Zone3_Auto', type: bacnet.enum.ApplicationTag.CHARACTER_STRING }],
+      // The only genuinely writable point right now — Auto/Manual mode select.
+      // Sensor mirrors (Flow, Moisture, Valve, Fault) stay read-only; writing them
+      // would fight PLC-owned logic instead of commanding anything real.
       [bacnet.enum.PropertyIdentifier.PRESENT_VALUE]: [{ value: 0, type: bacnet.enum.ApplicationTag.ENUMERATED }],
     },
   },

@@ -1,6 +1,6 @@
 const Bacnet = require('node-bacnet');
 const { mockBACnetDatabase, DEVICE_INSTANCE } = require('./device-object');
-const { startOpcua, zone3 } = require('./opcua-client');
+const { startOpcua, writeTag, zone3 } = require('./opcua-client');
 
 const DEVICE_VENDOR_ID = 999;
 
@@ -36,26 +36,41 @@ client.on('readProperty', (data) => {
   }
 });
 
-// --- WriteProperty (not wired back to OPC UA yet — TODO once reads are proven stable) ---
-client.on('writeProperty', (data) => {
+// --- WriteProperty: only Zone3_Auto (Binary Output 1) is genuinely writable — ---
+// --- it's the only point wired back to OPC UA. Everything else is a read-only ---
+// --- sensor mirror and correctly rejects writes, same as a real BACnet device. ---
+client.on('writeProperty', async (data) => {
   const { objectId, property, value } = data.payload;
   console.log(`[WriteProperty] type=${objectId.type} instance=${objectId.instance} prop=${property.id}`);
 
-  const objType = mockBACnetDatabase[objectId.type];
-  const obj = objType ? objType[objectId.instance] : null;
+  const isAutoPoint =
+    objectId.type === Bacnet.enum.ObjectType.BINARY_OUTPUT &&
+    objectId.instance === 1 &&
+    property.id === Bacnet.enum.PropertyIdentifier.PRESENT_VALUE;
 
-  if (obj && obj[property.id] && value && value.length) {
-    obj[property.id] = value;
-    console.log(`  -> new value: ${JSON.stringify(value[0].value)}`);
-    client.simpleAckResponse(data.header.sender, Bacnet.enum.ConfirmedServiceChoice.WRITE_PROPERTY, data.invokeId);
-    // TODO: push this write back into OPC UA via session.write(), same pattern as
-    // the web-SCADA project's writeBool(), once reads are proven stable end-to-end.
-  } else {
+  if (!isAutoPoint || !value || !value.length) {
     client.errorResponse(
       data.header.sender,
       data.invokeId,
       Bacnet.enum.ErrorClass.PROPERTY,
-      Bacnet.enum.ErrorCode.UNKNOWN_PROPERTY
+      Bacnet.enum.ErrorCode.WRITE_ACCESS_DENIED
+    );
+    return;
+  }
+
+  const boolValue = !!value[0].value; // 0/1 (Enumerated) -> boolean for OPC UA
+
+  try {
+    await writeTag('Z03_AUTO', boolValue);
+    mockBACnetDatabase[objectId.type][objectId.instance][property.id][0].value = boolValue ? 1 : 0;
+    client.simpleAckResponse(data.header.sender, Bacnet.enum.ConfirmedServiceChoice.WRITE_PROPERTY, data.invokeId);
+  } catch (err) {
+    console.error('  -> OPC UA write failed:', err.message);
+    client.errorResponse(
+      data.header.sender,
+      data.invokeId,
+      Bacnet.enum.ErrorClass.DEVICE,
+      Bacnet.enum.ErrorCode.OPERATIONAL_PROBLEM
     );
   }
 });
@@ -66,13 +81,15 @@ function syncFromOpcua() {
 
   const ai = mockBACnetDatabase[Bacnet.enum.ObjectType.ANALOG_INPUT];
   const bv = mockBACnetDatabase[Bacnet.enum.ObjectType.BINARY_VALUE];
+  const bo = mockBACnetDatabase[Bacnet.enum.ObjectType.BINARY_OUTPUT];
 
   if (zone3.FLOW !== null) ai[1][Bacnet.enum.PropertyIdentifier.PRESENT_VALUE][0].value = zone3.FLOW;
   if (zone3.MOISTURE !== null) ai[2][Bacnet.enum.PropertyIdentifier.PRESENT_VALUE][0].value = zone3.MOISTURE;
   if (zone3.VALVE !== null) bv[1][Bacnet.enum.PropertyIdentifier.PRESENT_VALUE][0].value = zone3.VALVE ? 1 : 0;
   if (zone3.FAULT !== null) bv[2][Bacnet.enum.PropertyIdentifier.PRESENT_VALUE][0].value = zone3.FAULT ? 1 : 0;
+  if (zone3.AUTO !== null) bo[1][Bacnet.enum.PropertyIdentifier.PRESENT_VALUE][0].value = zone3.AUTO ? 1 : 0;
 
-  console.log(`[Zone 03 -> BACnet] flow=${zone3.FLOW} moisture=${zone3.MOISTURE} valve=${zone3.VALVE} fault=${zone3.FAULT}`);
+  console.log(`[Zone 03 -> BACnet] flow=${zone3.FLOW} moisture=${zone3.MOISTURE} valve=${zone3.VALVE} fault=${zone3.FAULT} auto=${zone3.AUTO}`);
 }
 setInterval(syncFromOpcua, 1000);
 

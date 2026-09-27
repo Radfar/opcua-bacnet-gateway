@@ -6,6 +6,7 @@ const {
   SecurityPolicy,
   UserTokenType,
   AttributeIds,
+  DataType,
 } = opcua;
 
 const ENDPOINT = 'opc.tcp://127.0.0.1:4840';
@@ -13,15 +14,19 @@ const NS_URI = 'CODESYSSPV3/3S/IecVarAccess';
 const GVL_PATH = '|var|CODESYS Control Win V3 x64.Application.GVL_SCADA';
 const POLL_MS = 1000;
 
-// Only these Zone 03 tags feed the BACnet objects right now (read-only).
-// Confirmed live tag names from the working web-SCADA integration.
+// Read side: these feed the BACnet objects every poll.
 const WATCHED_TAGS = ['Z03_FLOW', 'Z03_MOISTURE', 'Z03_VALVE', 'Z03_FAULT'];
 
-const zone3 = { connected: false, FLOW: null, MOISTURE: null, VALVE: null, FAULT: null };
+// Write side: only Auto/Manual mode is safely commandable from BACnet right now.
+// Z03_VALVE/Z03_RUNNING are PLC-owned outputs — writing them would fight PLC logic.
+const WRITABLE_TAGS = ['Z03_AUTO'];
+
+const zone3 = { connected: false, FLOW: null, MOISTURE: null, VALVE: null, FAULT: null, AUTO: null };
 
 let client = null;
 let session = null;
 let pollTimer = null;
+const nodeIds = {}; // tag name -> node id string, populated on discovery
 
 /* Browse GVL_SCADA and return every variable inside it — same approach
    proven working in the web-SCADA project; robust to CODESYS project
@@ -58,21 +63,28 @@ async function startOpcua() {
   if (ns < 0) throw new Error('CODESYS namespace not found');
 
   const allTags = await discoverTags(ns);
-  const watched = allTags.filter((t) => WATCHED_TAGS.includes(t.name));
+  const neededNames = [...WATCHED_TAGS, ...WRITABLE_TAGS];
+  const needed = allTags.filter((t) => neededNames.includes(t.name));
 
-  if (watched.length !== WATCHED_TAGS.length) {
-    const missing = WATCHED_TAGS.filter((name) => !watched.some((t) => t.name === name));
+  if (needed.length !== neededNames.length) {
+    const missing = neededNames.filter((name) => !needed.some((t) => t.name === name));
     throw new Error(`Missing expected Zone 03 tags in GVL_SCADA: ${missing.join(', ')}`);
   }
 
-  console.log(`Watching: ${watched.map((t) => t.name).join(', ')}`);
+  needed.forEach((t) => { nodeIds[t.name] = t.nodeId; });
+  const watched = needed.filter((t) => WATCHED_TAGS.includes(t.name));
 
-  const nodes = watched.map((t) => ({ nodeId: t.nodeId, attributeId: AttributeIds.Value }));
+  console.log(`Watching: ${watched.map((t) => t.name).join(', ')}`);
+  console.log(`Writable: ${WRITABLE_TAGS.join(', ')}`);
+
+  // Poll the writable tag too, so zone3.AUTO reflects the current mode even before any write.
+  const pollList = [...watched, ...needed.filter((t) => WRITABLE_TAGS.includes(t.name))];
+  const nodes = pollList.map((t) => ({ nodeId: t.nodeId, attributeId: AttributeIds.Value }));
 
   pollTimer = setInterval(async () => {
     try {
       const res = await session.read(nodes);
-      watched.forEach((t, i) => {
+      pollList.forEach((t, i) => {
         const good = res[i].statusCode.isGood();
         const value = good ? res[i].value.value : null;
         zone3[t.name.slice(4)] = value; // Z03_FLOW -> FLOW
@@ -87,6 +99,24 @@ async function startOpcua() {
   console.log('OPC UA connected, polling Zone 03');
 }
 
+async function writeTag(tagName, boolValue) {
+  if (!WRITABLE_TAGS.includes(tagName)) {
+    throw new Error(`${tagName} is not in WRITABLE_TAGS — refusing write`);
+  }
+  if (!session || !zone3.connected) {
+    throw new Error('OPC UA not connected');
+  }
+  const status = await session.write({
+    nodeId: nodeIds[tagName],
+    attributeId: AttributeIds.Value,
+    value: { value: { dataType: DataType.Boolean, value: boolValue } },
+  });
+  if (!status.isGood()) {
+    throw new Error(`Write ${tagName} failed: ${status.toString()}`);
+  }
+  console.log(`[OPC UA write] ${tagName} -> ${boolValue}`);
+}
+
 async function stopOpcua() {
   try {
     if (pollTimer) clearInterval(pollTimer);
@@ -98,4 +128,4 @@ async function stopOpcua() {
   }
 }
 
-module.exports = { startOpcua, stopOpcua, zone3 };
+module.exports = { startOpcua, stopOpcua, writeTag, zone3 };
