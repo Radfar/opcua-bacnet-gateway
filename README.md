@@ -21,12 +21,12 @@ bacnet-device.js  — in-memory BACnet object store, mirrors live values
 Any BACnet client (Chipkin, YABE, a BAS front end, etc.)
 ```
 
-Exposed objects: `Zone3_Flow` and `Zone3_Moisture` (Analog Input), `Zone3_Valve` and `Zone3_Fault` (Binary Value) — sourced from the same CODESYS tags already proven live in my [web-based SCADA project].
+Exposed objects: `Zone3_Flow` and `Zone3_Moisture` (Analog Input), `Zone3_Valve` and `Zone3_Fault` (Binary Value, read-only), `Zone3_Auto` (Binary Output, writable — Auto/Manual mode) — sourced from the same CODESYS tags already proven live in my [web-based SCADA project].
 
 ## Status
 
 - ✅ **Read path verified end-to-end.** Live OPC UA values flow into the BACnet object store and were successfully read over a real BACnet ReadProperty request from a separate machine on the network — including both the Device object's static properties and a live Analog Input Present-Value.
-- 🚧 **Write path in progress.** WriteProperty is wired to accept and acknowledge writes into the local object store; pushing those writes back into OPC UA (so a BACnet-side command actually reaches CODESYS) is the current work.
+- ✅ **Write path verified end-to-end.** `Zone3_Auto` is the one genuinely commandable point, wired back into OPC UA — a BACnet WriteProperty from a separate machine flipped `Z03_AUTO`, which was confirmed not just as a changed tag but as real downstream CODESYS control behavior (the irrigation valve opened, flow and moisture began climbing in response). Sensor-mirror objects (Flow, Moisture, Valve, Fault) correctly reject writes with Write-Access-Denied instead of silently accepting them, matching real BACnet device behavior.
 
 ## The interesting part: debugging an undocumented library
 
@@ -36,6 +36,7 @@ What that meant in practice:
 - The event name a first pass assumed (`request`) doesn't exist in this library at all — confirmed by tracing `_processServiceRequest` in the library's source down to its `confirmedServiceMap`, which showed the real event names are `readProperty` and `writeProperty`.
 - The response method signatures (`readPropertyResponse`, `simpleAckResponse`) needed the exact parameter shapes read directly out of `client.js` — not inferred from naming conventions.
 - Early "it doesn't work" symptoms from two different BACnet client tools (YABE, Chipkin) turned out to be environment artifacts, not code bugs: both tools were running on the same machine as the gateway and colliding with their own embedded local BACnet devices. That was only provable by testing from a genuinely separate machine — a VM on an isolated network segment (NAT), after first ruling out a phone-hotspot client-isolation issue that was silently dropping bridged traffic.
+- WriteProperty's decoded payload shape isn't flat like ReadProperty's — `property`/`value`/`priority` are nested under a `value` key. Assuming they matched crashed the server on the first real write; the fix came from reading the library's own decode function through to its actual `return` statement.
 
 None of that is visible in the final code. It's the reason the final code is correct.
 
