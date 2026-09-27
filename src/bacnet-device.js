@@ -40,7 +40,8 @@ client.on('readProperty', (data) => {
 // --- it's the only point wired back to OPC UA. Everything else is a read-only ---
 // --- sensor mirror and correctly rejects writes, same as a real BACnet device. ---
 client.on('writeProperty', async (data) => {
-  const { objectId, property, value } = data.payload;
+  const { objectId, value: writeData } = data.payload;
+  const { property, value } = writeData; // real shape: payload.value.{property, value, priority}
   console.log(`[WriteProperty] type=${objectId.type} instance=${objectId.instance} prop=${property.id}`);
 
   const isAutoPoint =
