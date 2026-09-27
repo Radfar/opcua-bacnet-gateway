@@ -29,6 +29,7 @@ client.on('readProperty', (data) => {
   } else {
     client.errorResponse(
       data.header.sender,
+      Bacnet.enum.ConfirmedServiceChoice.READ_PROPERTY,
       data.invokeId,
       Bacnet.enum.ErrorClass.PROPERTY,
       Bacnet.enum.ErrorCode.UNKNOWN_PROPERTY
@@ -52,6 +53,7 @@ client.on('writeProperty', async (data) => {
   if (!isAutoPoint || !value || !value.length) {
     client.errorResponse(
       data.header.sender,
+      Bacnet.enum.ConfirmedServiceChoice.WRITE_PROPERTY,
       data.invokeId,
       Bacnet.enum.ErrorClass.PROPERTY,
       Bacnet.enum.ErrorCode.WRITE_ACCESS_DENIED
@@ -69,6 +71,7 @@ client.on('writeProperty', async (data) => {
     console.error('  -> OPC UA write failed:', err.message);
     client.errorResponse(
       data.header.sender,
+      Bacnet.enum.ConfirmedServiceChoice.WRITE_PROPERTY,
       data.invokeId,
       Bacnet.enum.ErrorClass.DEVICE,
       Bacnet.enum.ErrorCode.OPERATIONAL_PROBLEM
