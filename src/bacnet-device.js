@@ -3,6 +3,9 @@ const Bacnet = require('node-bacnet');
 const { mockBACnetDatabase, DEVICE_INSTANCE } = require('./device-object');
 const { startOpcua, writeTag, zone3 } = require('./opcua-client');
 const historian = require('./historian');
+// --- COV (Change-of-Value) subscriptions ---
+const covSubscriptions = new Map(); // key: "type-instance" -> array of subscriber objects
+const lastSyncedValues = {};        // key: "type-instance" -> last raw value, for change detection
 
 const DEVICE_VENDOR_ID = 999;
 
@@ -69,6 +72,7 @@ client.on('writeProperty', async (data) => {
     await writeTag('Z03_AUTO', boolValue);
     mockBACnetDatabase[objectId.type][objectId.instance][property.id][0].value = boolValue ? 1 : 0;
     historian.logValue('Z03_AUTO', boolValue ? 1 : 0).catch(err => console.error('[Historian] AUTO log failed:', err.message));
+    checkAndNotifyCov({ type: Bacnet.enum.ObjectType.BINARY_OUTPUT, instance: 1 }, boolValue ? 1 : 0);
     client.simpleAckResponse(data.header.sender, Bacnet.enum.ConfirmedServiceChoice.WRITE_PROPERTY, data.invokeId);
   } catch (err) {
     console.error('  -> OPC UA write failed:', err.message);
@@ -82,6 +86,49 @@ client.on('writeProperty', async (data) => {
   }
 });
 
+client.on('subscribeCov', (data) => {
+  const { subscriberProcessId, monitoredObjectId, cancellationRequest, issueConfirmedNotifications, lifetime } = data.payload;
+  const key = `${monitoredObjectId.type}-${monitoredObjectId.instance}`;
+  console.log(`[SubscribeCOV] subscriber=${subscriberProcessId} object=${key} cancel=${cancellationRequest}`);
+
+  if (cancellationRequest) {
+    const subs = covSubscriptions.get(key) || [];
+    covSubscriptions.set(key, subs.filter(s => s.subscriberProcessId !== subscriberProcessId));
+    client.simpleAckResponse(data.header.sender, Bacnet.enum.ConfirmedServiceChoice.SUBSCRIBE_COV, data.invokeId);
+    return;
+  }
+
+  const objType = mockBACnetDatabase[monitoredObjectId.type];
+  const obj = objType ? objType[monitoredObjectId.instance] : null;
+  if (!obj) {
+    client.errorResponse(
+      data.header.sender,
+      Bacnet.enum.ConfirmedServiceChoice.SUBSCRIBE_COV,
+      data.invokeId,
+      Bacnet.enum.ErrorClass.OBJECT,
+      Bacnet.enum.ErrorCode.UNKNOWN_OBJECT
+    );
+    return;
+  }
+
+  const subs = covSubscriptions.get(key) || [];
+  const existing = subs.find(s => s.subscriberProcessId === subscriberProcessId);
+  const subscription = {
+    subscriberProcessId,
+    receiver: data.header.sender,
+    issueConfirmedNotifications,
+    expiresAt: Date.now() + lifetime * 1000,
+  };
+  if (existing) Object.assign(existing, subscription);
+  else subs.push(subscription);
+  covSubscriptions.set(key, subs);
+
+  client.simpleAckResponse(data.header.sender, Bacnet.enum.ConfirmedServiceChoice.SUBSCRIBE_COV, data.invokeId);
+
+  // BACnet spec requires one notification immediately upon successful subscription
+  sendCovNotification(monitoredObjectId, [subscription]);
+});
+
 // --- Push live Zone 03 OPC UA values into the BACnet object store, and log to historian ---
 function syncFromOpcua() {
   if (!zone3.connected) return;
@@ -90,11 +137,26 @@ function syncFromOpcua() {
   const bv = mockBACnetDatabase[Bacnet.enum.ObjectType.BINARY_VALUE];
   const bo = mockBACnetDatabase[Bacnet.enum.ObjectType.BINARY_OUTPUT];
 
-  if (zone3.FLOW !== null) ai[1][Bacnet.enum.PropertyIdentifier.PRESENT_VALUE][0].value = zone3.FLOW;
-  if (zone3.MOISTURE !== null) ai[2][Bacnet.enum.PropertyIdentifier.PRESENT_VALUE][0].value = zone3.MOISTURE;
-  if (zone3.VALVE !== null) bv[1][Bacnet.enum.PropertyIdentifier.PRESENT_VALUE][0].value = zone3.VALVE ? 1 : 0;
-  if (zone3.FAULT !== null) bv[2][Bacnet.enum.PropertyIdentifier.PRESENT_VALUE][0].value = zone3.FAULT ? 1 : 0;
-  if (zone3.AUTO !== null) bo[1][Bacnet.enum.PropertyIdentifier.PRESENT_VALUE][0].value = zone3.AUTO ? 1 : 0;
+    if (zone3.FLOW !== null) {
+    ai[1][Bacnet.enum.PropertyIdentifier.PRESENT_VALUE][0].value = zone3.FLOW;
+    checkAndNotifyCov({ type: Bacnet.enum.ObjectType.ANALOG_INPUT, instance: 1 }, zone3.FLOW);
+  }
+  if (zone3.MOISTURE !== null) {
+    ai[2][Bacnet.enum.PropertyIdentifier.PRESENT_VALUE][0].value = zone3.MOISTURE;
+    checkAndNotifyCov({ type: Bacnet.enum.ObjectType.ANALOG_INPUT, instance: 2 }, zone3.MOISTURE);
+  }
+  if (zone3.VALVE !== null) {
+    bv[1][Bacnet.enum.PropertyIdentifier.PRESENT_VALUE][0].value = zone3.VALVE ? 1 : 0;
+    checkAndNotifyCov({ type: Bacnet.enum.ObjectType.BINARY_VALUE, instance: 1 }, zone3.VALVE ? 1 : 0);
+  }
+  if (zone3.FAULT !== null) {
+    bv[2][Bacnet.enum.PropertyIdentifier.PRESENT_VALUE][0].value = zone3.FAULT ? 1 : 0;
+    checkAndNotifyCov({ type: Bacnet.enum.ObjectType.BINARY_VALUE, instance: 2 }, zone3.FAULT ? 1 : 0);
+  }
+  if (zone3.AUTO !== null) {
+    bo[1][Bacnet.enum.PropertyIdentifier.PRESENT_VALUE][0].value = zone3.AUTO ? 1 : 0;
+    checkAndNotifyCov({ type: Bacnet.enum.ObjectType.BINARY_OUTPUT, instance: 1 }, zone3.AUTO ? 1 : 0);
+  }
 
   console.log(`[Zone 03 -> BACnet] flow=${zone3.FLOW} moisture=${zone3.MOISTURE} valve=${zone3.VALVE} fault=${zone3.FAULT} auto=${zone3.AUTO}`);
 
@@ -115,3 +177,35 @@ setInterval(syncFromOpcua, 1000);
 historian.initHistorian()
   .then(() => startOpcua().catch(err => console.error('Failed to start OPC UA client:', err.message)))
   .catch(err => console.error('Failed to initialize historian:', err.message));
+
+function sendCovNotification(objectId, subscribers) {
+  const objType = mockBACnetDatabase[objectId.type];
+  const obj = objType ? objType[objectId.instance] : null;
+  if (!obj) return;
+
+  const presentValue = obj[Bacnet.enum.PropertyIdentifier.PRESENT_VALUE];
+  const values = [{ property: { id: Bacnet.enum.PropertyIdentifier.PRESENT_VALUE }, value: presentValue }];
+
+  for (const sub of subscribers) {
+    const remaining = Math.max(0, Math.round((sub.expiresAt - Date.now()) / 1000));
+    if (sub.issueConfirmedNotifications) {
+      client.confirmedCOVNotification(
+        sub.receiver, objectId, sub.subscriberProcessId, DEVICE_INSTANCE, remaining, values,
+        (err) => { if (err) console.error('[COV] confirmed notify failed:', err.message); }
+      );
+    } else {
+      client.unconfirmedCOVNotification(sub.receiver.address, sub.subscriberProcessId, DEVICE_INSTANCE, objectId, remaining, values);
+    }
+  }
+  console.log(`[COV] Notified ${subscribers.length} subscriber(s) for ${objectId.type}-${objectId.instance}`);
+}
+
+function checkAndNotifyCov(objectId, newRawValue) {
+  const key = `${objectId.type}-${objectId.instance}`;
+  if (lastSyncedValues[key] === newRawValue) return;
+  lastSyncedValues[key] = newRawValue;
+
+  const subs = (covSubscriptions.get(key) || []).filter(s => s.expiresAt > Date.now());
+  covSubscriptions.set(key, subs);
+  if (subs.length > 0) sendCovNotification(objectId, subs);
+}
