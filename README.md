@@ -5,19 +5,8 @@ A software-only OPC UA → BACnet/IP gateway, built in Node.js. It polls live pr
 Built and verified against a CODESYS SoftPLC-based irrigation testbed (Zone 03: flow, moisture, valve position, fault status, and an automatic-mode command point).
 
 ## Architecture
-
-```
-Industrial Control System (CODESYS, OPC UA server)
-        │ OPC UA
-        ▼
-Node.js Integration Layer  ──►  PostgreSQL Historian
- (OPC UA client + BACnet/IP server)
-        │ BACnet/IP
-        ▼
-BACnet Client / BAS environment
-```
-
-See `docs/images/architecture.png` for the full diagram (current implementation vs. future roadmap).
+![Current implementation](docs/images/Architecture.png)
+![Current implementation vs. Future roadmap](docs/images/Architecture_Current_Future.png)
 
 ## Verified Capabilities
 
