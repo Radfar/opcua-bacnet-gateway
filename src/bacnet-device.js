@@ -1,6 +1,8 @@
+require('dotenv').config();
 const Bacnet = require('node-bacnet');
 const { mockBACnetDatabase, DEVICE_INSTANCE } = require('./device-object');
 const { startOpcua, writeTag, zone3 } = require('./opcua-client');
+const historian = require('./historian');
 
 const DEVICE_VENDOR_ID = 999;
 
@@ -66,6 +68,7 @@ client.on('writeProperty', async (data) => {
   try {
     await writeTag('Z03_AUTO', boolValue);
     mockBACnetDatabase[objectId.type][objectId.instance][property.id][0].value = boolValue ? 1 : 0;
+    historian.logValue('Z03_AUTO', boolValue ? 1 : 0).catch(err => console.error('[Historian] AUTO log failed:', err.message));
     client.simpleAckResponse(data.header.sender, Bacnet.enum.ConfirmedServiceChoice.WRITE_PROPERTY, data.invokeId);
   } catch (err) {
     console.error('  -> OPC UA write failed:', err.message);
@@ -100,3 +103,36 @@ setInterval(syncFromOpcua, 1000);
 startOpcua().catch((err) => {
   console.error('Failed to start OPC UA client:', err.message);
 });
+// --- Push live Zone 03 OPC UA values into the BACnet object store, and log to historian ---
+function syncFromOpcua() {
+  if (!zone3.connected) return;
+
+  const ai = mockBACnetDatabase[Bacnet.enum.ObjectType.ANALOG_INPUT];
+  const bv = mockBACnetDatabase[Bacnet.enum.ObjectType.BINARY_VALUE];
+  const bo = mockBACnetDatabase[Bacnet.enum.ObjectType.BINARY_OUTPUT];
+
+  if (zone3.FLOW !== null) ai[1][Bacnet.enum.PropertyIdentifier.PRESENT_VALUE][0].value = zone3.FLOW;
+  if (zone3.MOISTURE !== null) ai[2][Bacnet.enum.PropertyIdentifier.PRESENT_VALUE][0].value = zone3.MOISTURE;
+  if (zone3.VALVE !== null) bv[1][Bacnet.enum.PropertyIdentifier.PRESENT_VALUE][0].value = zone3.VALVE ? 1 : 0;
+  if (zone3.FAULT !== null) bv[2][Bacnet.enum.PropertyIdentifier.PRESENT_VALUE][0].value = zone3.FAULT ? 1 : 0;
+  if (zone3.AUTO !== null) bo[1][Bacnet.enum.PropertyIdentifier.PRESENT_VALUE][0].value = zone3.AUTO ? 1 : 0;
+
+  console.log(`[Zone 03 -> BACnet] flow=${zone3.FLOW} moisture=${zone3.MOISTURE} valve=${zone3.VALVE} fault=${zone3.FAULT} auto=${zone3.AUTO}`);
+
+  // Fire-and-forget: don't block the sync loop on DB writes, but don't lose errors either
+  logToHistorian().catch(err => console.error('[Historian] log failed:', err.message));
+}
+
+async function logToHistorian() {
+  if (zone3.FLOW !== null) await historian.logValue('Z03_FLOW', zone3.FLOW);
+  if (zone3.MOISTURE !== null) await historian.logValue('Z03_MOISTURE', zone3.MOISTURE);
+  if (zone3.VALVE !== null) await historian.logValue('Z03_VALVE', zone3.VALVE ? 1 : 0);
+  if (zone3.FAULT !== null) await historian.logValue('Z03_FAULT', zone3.FAULT ? 1 : 0);
+}
+
+setInterval(syncFromOpcua, 1000);
+
+// Initialize historian tag cache before starting OPC UA
+historian.initHistorian()
+  .then(() => startOpcua().catch(err => console.error('Failed to start OPC UA client:', err.message)))
+  .catch(err => console.error('Failed to initialize historian:', err.message));
