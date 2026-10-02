@@ -1,54 +1,79 @@
-# OPC UA → BACnet Gateway
+# opcua-bacnet-gateway
 
-A Node.js gateway that bridges live CODESYS PLC data (via OPC UA) into BACnet/IP — letting a BAS/BMS system (or any standard BACnet client) read real industrial process data without any native BACnet support on the PLC side.
+A software-only OPC UA → BACnet/IP gateway, built in Node.js. It polls live process data from an industrial controller over OPC UA and exposes it as real BACnet/IP objects — readable and writable by any standard BACnet client — with no dedicated gateway hardware and no commercial gateway license.
 
-## Why this exists
-
-Most OT/IT integration work I do sits on the SCADA/IIoT side — Ignition, web-based SCADA, OPC UA, MQTT. BACnet/BAS is the one corner of the stack I hadn't built hands-on proof for. This project closes that gap: a real bridge, against real controller data, not a simulated example.
+Built and verified against a CODESYS SoftPLC-based irrigation testbed (Zone 03: flow, moisture, valve position, fault status, and an automatic-mode command point).
 
 ## Architecture
 
 ```
-CODESYS (Zone 03 irrigation control)
-   │  OPC UA (opc.tcp://127.0.0.1:4840)
-   ▼
-opcua-client.js   — browses GVL_SCADA, polls Zone 03 tags every 1s
-   │
-   ▼
-bacnet-device.js  — in-memory BACnet object store, mirrors live values
-   │  BACnet/IP (UDP 47808)
-   ▼
-Any BACnet client (Chipkin, YABE, a BAS front end, etc.)
+Industrial Control System (CODESYS, OPC UA server)
+        │ OPC UA
+        ▼
+Node.js Integration Layer  ──►  PostgreSQL Historian
+ (OPC UA client + BACnet/IP server)
+        │ BACnet/IP
+        ▼
+BACnet Client / BAS environment
 ```
 
-Exposed objects: `Zone3_Flow` and `Zone3_Moisture` (Analog Input), `Zone3_Valve` and `Zone3_Fault` (Binary Value, read-only), `Zone3_Auto` (Binary Output, writable — Auto/Manual mode) — sourced from the same CODESYS tags already proven live in my [web-based SCADA project].
+See `docs/images/architecture.png` for the full diagram (current implementation vs. future roadmap).
 
-## Status
+## Verified Capabilities
 
-- ✅ **Read path verified end-to-end.** Live OPC UA values flow into the BACnet object store and were successfully read over a real BACnet ReadProperty request from a separate machine on the network — including both the Device object's static properties and a live Analog Input Present-Value.
-- ✅ **Write path verified end-to-end.** `Zone3_Auto` is the one genuinely commandable point, wired back into OPC UA — a BACnet WriteProperty from a separate machine flipped `Z03_AUTO`, which was confirmed not just as a changed tag but as real downstream CODESYS control behavior (the irrigation valve opened, flow and moisture began climbing in response). Sensor-mirror objects (Flow, Moisture, Valve, Fault) correctly reject writes with Write-Access-Denied instead of silently accepting them, matching real BACnet device behavior.
+### Device Discovery
+Responds to BACnet `Who-Is` broadcasts with a correct `I-Am`, identifying itself as a BACnet device on the network.
 
-## The interesting part: debugging an undocumented library
+### ReadProperty
+Returns live `Present-Value` for each mapped object, tracking the underlying OPC UA source in real time.
 
-The BACnet library used here (`node-bacnet`) documents its *client* role well, but its *server*-side behavior — actually responding to another device's ReadProperty/WriteProperty requests, which is what a gateway needs — is marked **Beta: untested, undocumented, breaking interface** in the library's own feature table. There was no working example to copy.
+- Flow, moisture → Analog Input
+- Valve, fault → Binary Value
+- Automatic mode → Binary Output
 
-What that meant in practice:
-- The event name a first pass assumed (`request`) doesn't exist in this library at all — confirmed by tracing `_processServiceRequest` in the library's source down to its `confirmedServiceMap`, which showed the real event names are `readProperty` and `writeProperty`.
-- The response method signatures (`readPropertyResponse`, `simpleAckResponse`) needed the exact parameter shapes read directly out of `client.js` — not inferred from naming conventions.
-- Early "it doesn't work" symptoms from two different BACnet client tools (YABE, Chipkin) turned out to be environment artifacts, not code bugs: both tools were running on the same machine as the gateway and colliding with their own embedded local BACnet devices. That was only provable by testing from a genuinely separate machine — a VM on an isolated network segment (NAT), after first ruling out a phone-hotspot client-isolation issue that was silently dropping bridged traffic.
-- WriteProperty's decoded payload shape isn't flat like ReadProperty's — `property`/`value`/`priority` are nested under a `value` key. Assuming they matched crashed the server on the first real write; the fix came from reading the library's own decode function through to its actual `return` statement.
+![ReadProperty verification](docs/images/read-property.png)
 
-None of that is visible in the final code. It's the reason the final code is correct.
+### WriteProperty
+The automatic-mode point (`Z03_AUTO`) is genuinely writable — a BACnet `WriteProperty` is transferred as a real OPC UA write back to the controller, producing actual downstream PLC behavior, not just a stored flag in the gateway.
 
-## Stack
+All other points are read-only sensor mirrors and correctly reject writes with a decoded `Write-Access-Denied` BACnet error, rather than timing out or silently failing.
 
-Node.js · `node-bacnet` · `node-opcua-client` · CODESYS (OPC UA server) · BACnet/IP
+![WriteProperty verification](docs/images/write-property.png)
 
-## Running it
+### COV (Change-of-Value) Subscriptions
+Clients can subscribe to any object instead of polling. The gateway tracks per-object subscribers and pushes a notification (`UnconfirmedCOVNotification` or `ConfirmedCOVNotification`, depending on what the subscriber requested) the moment a value actually changes — including one immediate notification on successful subscription, per the BACnet spec.
 
-```bash
+Verified end-to-end: live CODESYS value changes streamed to an independent BACnet client on a separate machine, with zero polling on the client side.
+
+![COV notifications in the client log](docs/images/cov-log.png)
+![Live dashboard updating via COV](docs/images/dashboard.png)
+
+A minimal operator-style web dashboard (Express + vanilla JS) was built on the client side specifically to demonstrate this — each value shows a `COV` tag when it arrives via push rather than initial read.
+
+### Historian
+Every polled value and every successful write is logged to a PostgreSQL database (`equipment` / `tags` / `tag_values` schema), building a time-series record for later trend review.
+
+## Independent Test Environment
+
+The BACnet client (and dashboard) runs on a separate virtual machine, not on the same host as the gateway — this ensures testing exercises real BACnet/IP network communication rather than only the gateway's own in-process logic.
+
+## Not Yet Implemented
+
+Documented honestly rather than implied:
+
+- BACnet/SC (secure, TLS-based BACnet) — plain BACnet/IP only, currently
+- Validation against a commercial BAS supervisory platform (e.g. Niagara) — tested against an independent custom client only
+- AI-assisted historian analytics — historian data is being collected; analysis layer is planned, not built
+- Multi-protocol source support — architecture generalizes beyond OPC UA, but only OPC UA is implemented
+
+## Setup
+
+```
 npm install
+cp .env.example .env   # fill in your DB and OPC UA connection details
 node src/bacnet-device.js
 ```
 
-Requires a CODESYS project with the Zone 03 program running and its OPC UA server active on `127.0.0.1:4840`.
+## License
+
+See `LICENSE`.
