@@ -82,27 +82,6 @@ client.on('writeProperty', async (data) => {
   }
 });
 
-// --- Push live Zone 03 OPC UA values into the BACnet object store ---
-function syncFromOpcua() {
-  if (!zone3.connected) return; // keep last-known-good values rather than overwriting with null
-
-  const ai = mockBACnetDatabase[Bacnet.enum.ObjectType.ANALOG_INPUT];
-  const bv = mockBACnetDatabase[Bacnet.enum.ObjectType.BINARY_VALUE];
-  const bo = mockBACnetDatabase[Bacnet.enum.ObjectType.BINARY_OUTPUT];
-
-  if (zone3.FLOW !== null) ai[1][Bacnet.enum.PropertyIdentifier.PRESENT_VALUE][0].value = zone3.FLOW;
-  if (zone3.MOISTURE !== null) ai[2][Bacnet.enum.PropertyIdentifier.PRESENT_VALUE][0].value = zone3.MOISTURE;
-  if (zone3.VALVE !== null) bv[1][Bacnet.enum.PropertyIdentifier.PRESENT_VALUE][0].value = zone3.VALVE ? 1 : 0;
-  if (zone3.FAULT !== null) bv[2][Bacnet.enum.PropertyIdentifier.PRESENT_VALUE][0].value = zone3.FAULT ? 1 : 0;
-  if (zone3.AUTO !== null) bo[1][Bacnet.enum.PropertyIdentifier.PRESENT_VALUE][0].value = zone3.AUTO ? 1 : 0;
-
-  console.log(`[Zone 03 -> BACnet] flow=${zone3.FLOW} moisture=${zone3.MOISTURE} valve=${zone3.VALVE} fault=${zone3.FAULT} auto=${zone3.AUTO}`);
-}
-setInterval(syncFromOpcua, 1000);
-
-startOpcua().catch((err) => {
-  console.error('Failed to start OPC UA client:', err.message);
-});
 // --- Push live Zone 03 OPC UA values into the BACnet object store, and log to historian ---
 function syncFromOpcua() {
   if (!zone3.connected) return;
