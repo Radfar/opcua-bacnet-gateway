@@ -158,8 +158,7 @@ function syncFromOpcua() {
     checkAndNotifyCov({ type: Bacnet.enum.ObjectType.BINARY_OUTPUT, instance: 1 }, zone3.AUTO ? 1 : 0);
   }
 
-  console.log(`[Zone 03 -> BACnet] flow=${zone3.FLOW} moisture=${zone3.MOISTURE} valve=${zone3.VALVE} fault=${zone3.FAULT} auto=${zone3.AUTO}`);
-
+  console.log(`[Zone 03 -> BACnet] flow=${zone3.FLOW} moisture=${zone3.MOISTURE?.toFixed(2)} valve=${zone3.VALVE} fault=${zone3.FAULT} auto=${zone3.AUTO}`);
   // Fire-and-forget: don't block the sync loop on DB writes, but don't lose errors either
   logToHistorian().catch(err => console.error('[Historian] log failed:', err.message));
 }
