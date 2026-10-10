@@ -65,6 +65,8 @@ const mockBACnetDatabase = {
       // Sensor mirrors (Flow, Moisture, Valve, Fault) stay read-only; writing them
       // would fight PLC-owned logic instead of commanding anything real.
       [bacnet.enum.PropertyIdentifier.PRESENT_VALUE]: [{ value: 0, type: bacnet.enum.ApplicationTag.ENUMERATED }],
+      [bacnet.enum.PropertyIdentifier.PRIORITY_ARRAY]: Array(16).fill({ type: bacnet.enum.ApplicationTag.NULL, value: null }),
+      [bacnet.enum.PropertyIdentifier.RELINQUISH_DEFAULT]: [{ value: 0, type: bacnet.enum.ApplicationTag.ENUMERATED }],
     },
   },
 };

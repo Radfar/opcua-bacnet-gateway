@@ -10,9 +10,22 @@ const lastSyncedValues = {};        // key: "type-instance" -> last raw value, f
 const DEVICE_VENDOR_ID = 999;
 
 const client = new Bacnet({ port: 47808, interface: '0.0.0.0' });
+let autoHoldUntil = 0; // after a BACnet write, ignore the polled AUTO value briefly (the OPC UA poll lags the write)
 
 console.log('BACnet/IP Native Client-Server Stack Initialized');
 console.log(`Exposing Device Instance: ${DEVICE_INSTANCE} on UDP Port 47808`);
+
+function resolvePriorityArray(obj) {
+  const array = obj[Bacnet.enum.PropertyIdentifier.PRIORITY_ARRAY];
+  for (let i = 0; i < 16; i++) {
+    if (array[i].type !== Bacnet.enum.ApplicationTag.NULL) {
+      return { value: array[i], priority: i + 1 };
+    }
+  }
+  const def = obj[Bacnet.enum.PropertyIdentifier.RELINQUISH_DEFAULT][0];
+  return { value: def, priority: null }; // null = running on Relinquish_Default, no active commander
+}
+
 
 // --- Discovery ---
 client.on('whoIs', (data) => {
@@ -45,17 +58,25 @@ client.on('readProperty', (data) => {
 // --- WriteProperty: only Zone3_Auto (Binary Output 1) is genuinely writable — ---
 // --- it's the only point wired back to OPC UA. Everything else is a read-only ---
 // --- sensor mirror and correctly rejects writes, same as a real BACnet device. ---
+// --- Zone3_Auto itself uses a real BACnet Priority_Array (16 levels) rather ---
+// --- than a flat overwrite — see resolvePriorityArray(). ---
 client.on('writeProperty', async (data) => {
   const { objectId, value: writeData } = data.payload;
-  const { property, value } = writeData; // real shape: payload.value.{property, value, priority}
+
+
+
+  const { property, value, priority } = writeData; // priority sits alongside property/value, not inside property
   console.log(`[WriteProperty] type=${objectId.type} instance=${objectId.instance} prop=${property.id}`);
 
   const isAutoPoint =
-    objectId.type === Bacnet.enum.ObjectType.BINARY_OUTPUT &&
-    objectId.instance === 1 &&
-    property.id === Bacnet.enum.PropertyIdentifier.PRESENT_VALUE;
+  objectId.type === Bacnet.enum.ObjectType.BINARY_OUTPUT &&
+  objectId.instance === 1 &&
+  property.id === Bacnet.enum.PropertyIdentifier.PRESENT_VALUE;
 
+  // Reject FIRST, before touching any object state — nothing below this point
+  // should execute for a non-Auto write.
   if (!isAutoPoint || !value || !value.length) {
+    console.log(`[WriteProperty] REJECTED: type=${objectId.type} instance=${objectId.instance} is not a commandable point`);
     client.errorResponse(
       data.header.sender,
       Bacnet.enum.ConfirmedServiceChoice.WRITE_PROPERTY,
@@ -66,22 +87,42 @@ client.on('writeProperty', async (data) => {
     return;
   }
 
-  const boolValue = !!value[0].value; // 0/1 (Enumerated) -> boolean for OPC UA
+  const bo = mockBACnetDatabase[Bacnet.enum.ObjectType.BINARY_OUTPUT][1];
+  const writePriority = priority || 16; // now reads the real decoded value
+  if (writePriority < 1 || writePriority > 16) {  
+    client.errorResponse(
+      data.header.sender, Bacnet.enum.ConfirmedServiceChoice.WRITE_PROPERTY, data.invokeId,
+      Bacnet.enum.ErrorClass.PROPERTY, Bacnet.enum.ErrorCode.VALUE_OUT_OF_RANGE
+    );
+    return;
+  }
+
+  const slot = bo[Bacnet.enum.PropertyIdentifier.PRIORITY_ARRAY];
+  const isRelinquish = value[0].type === Bacnet.enum.ApplicationTag.NULL;
+  slot[priority - 1] = isRelinquish
+    ? { type: Bacnet.enum.ApplicationTag.NULL, value: null }
+    : { type: value[0].type, value: value[0].value };
+
+  const resolved = resolvePriorityArray(bo);
+  const resolvedBool = !!resolved.value.value;
+  const previousBool = !!bo[Bacnet.enum.PropertyIdentifier.PRESENT_VALUE][0].value;
+
+  console.log(`[WriteProperty] Z03_AUTO priority=${priority} ${isRelinquish ? 'RELINQUISH' : 'value=' + resolvedBool} -> resolved=${resolvedBool} (winning priority: ${resolved.priority ?? 'default'})`);
 
   try {
-    await writeTag('Z03_AUTO', boolValue);
-    mockBACnetDatabase[objectId.type][objectId.instance][property.id][0].value = boolValue ? 1 : 0;
-    historian.logValue('Z03_AUTO', boolValue ? 1 : 0).catch(err => console.error('[Historian] AUTO log failed:', err.message));
-    checkAndNotifyCov({ type: Bacnet.enum.ObjectType.BINARY_OUTPUT, instance: 1 }, boolValue ? 1 : 0);
+    if (resolvedBool !== previousBool) {
+      await writeTag('Z03_AUTO', resolvedBool);
+      autoHoldUntil = Date.now() + 3000;
+      bo[Bacnet.enum.PropertyIdentifier.PRESENT_VALUE][0].value = resolvedBool ? 1 : 0;
+      historian.logValue('Z03_AUTO', resolvedBool ? 1 : 0).catch(err => console.error('[Historian] AUTO log failed:', err.message));
+      checkAndNotifyCov({ type: Bacnet.enum.ObjectType.BINARY_OUTPUT, instance: 1 }, resolvedBool ? 1 : 0);
+    }
     client.simpleAckResponse(data.header.sender, Bacnet.enum.ConfirmedServiceChoice.WRITE_PROPERTY, data.invokeId);
   } catch (err) {
     console.error('  -> OPC UA write failed:', err.message);
     client.errorResponse(
-      data.header.sender,
-      Bacnet.enum.ConfirmedServiceChoice.WRITE_PROPERTY,
-      data.invokeId,
-      Bacnet.enum.ErrorClass.DEVICE,
-      Bacnet.enum.ErrorCode.OPERATIONAL_PROBLEM
+      data.header.sender, Bacnet.enum.ConfirmedServiceChoice.WRITE_PROPERTY, data.invokeId,
+      Bacnet.enum.ErrorClass.DEVICE, Bacnet.enum.ErrorCode.OPERATIONAL_PROBLEM
     );
   }
 });
@@ -153,11 +194,10 @@ function syncFromOpcua() {
     bv[2][Bacnet.enum.PropertyIdentifier.PRESENT_VALUE][0].value = zone3.FAULT ? 1 : 0;
     checkAndNotifyCov({ type: Bacnet.enum.ObjectType.BINARY_VALUE, instance: 2 }, zone3.FAULT ? 1 : 0);
   }
-  if (zone3.AUTO !== null) {
+  if (zone3.AUTO !== null && Date.now() > autoHoldUntil) {
     bo[1][Bacnet.enum.PropertyIdentifier.PRESENT_VALUE][0].value = zone3.AUTO ? 1 : 0;
     checkAndNotifyCov({ type: Bacnet.enum.ObjectType.BINARY_OUTPUT, instance: 1 }, zone3.AUTO ? 1 : 0);
   }
-
   console.log(`[Zone 03 -> BACnet] flow=${zone3.FLOW} moisture=${zone3.MOISTURE?.toFixed(2)} valve=${zone3.VALVE} fault=${zone3.FAULT} auto=${zone3.AUTO}`);
   // Fire-and-forget: don't block the sync loop on DB writes, but don't lose errors either
   logToHistorian().catch(err => console.error('[Historian] log failed:', err.message));
