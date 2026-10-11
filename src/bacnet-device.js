@@ -6,11 +6,10 @@ const historian = require('./historian');
 // --- COV (Change-of-Value) subscriptions ---
 const covSubscriptions = new Map(); // key: "type-instance" -> array of subscriber objects
 const lastSyncedValues = {};        // key: "type-instance" -> last raw value, for change detection
-
+let pendingAuto = null; // set after a BACnet write until the OPC UA poll confirms it
 const DEVICE_VENDOR_ID = 999;
 
 const client = new Bacnet({ port: 47808, interface: '0.0.0.0' });
-let autoHoldUntil = 0; // after a BACnet write, ignore the polled AUTO value briefly (the OPC UA poll lags the write)
 
 console.log('BACnet/IP Native Client-Server Stack Initialized');
 console.log(`Exposing Device Instance: ${DEVICE_INSTANCE} on UDP Port 47808`);
@@ -106,13 +105,12 @@ client.on('writeProperty', async (data) => {
   const resolved = resolvePriorityArray(bo);
   const resolvedBool = !!resolved.value.value;
   const previousBool = !!bo[Bacnet.enum.PropertyIdentifier.PRESENT_VALUE][0].value;
-
-  console.log(`[WriteProperty] Z03_AUTO priority=${priority} ${isRelinquish ? 'RELINQUISH' : 'value=' + resolvedBool} -> resolved=${resolvedBool} (winning priority: ${resolved.priority ?? 'default'})`);
+  console.log(`[WriteProperty] Z03_AUTO priority=${priority} ${isRelinquish ? 'RELINQUISH' : 'value=' + !!value[0].value} -> resolved=${resolvedBool} (winning priority: ${resolved.priority ?? 'default'})`);
 
   try {
     if (resolvedBool !== previousBool) {
       await writeTag('Z03_AUTO', resolvedBool);
-      autoHoldUntil = Date.now() + 3000;
+      pendingAuto = { value: resolvedBool, expires: Date.now() + 5000 };
       bo[Bacnet.enum.PropertyIdentifier.PRESENT_VALUE][0].value = resolvedBool ? 1 : 0;
       historian.logValue('Z03_AUTO', resolvedBool ? 1 : 0).catch(err => console.error('[Historian] AUTO log failed:', err.message));
       checkAndNotifyCov({ type: Bacnet.enum.ObjectType.BINARY_OUTPUT, instance: 1 }, resolvedBool ? 1 : 0);
@@ -174,32 +172,45 @@ client.on('subscribeCov', (data) => {
 function syncFromOpcua() {
   if (!zone3.connected) return;
 
-  const ai = mockBACnetDatabase[Bacnet.enum.ObjectType.ANALOG_INPUT];
-  const bv = mockBACnetDatabase[Bacnet.enum.ObjectType.BINARY_VALUE];
-  const bo = mockBACnetDatabase[Bacnet.enum.ObjectType.BINARY_OUTPUT];
+  const PV = Bacnet.enum.PropertyIdentifier.PRESENT_VALUE;
+  const T = Bacnet.enum.ObjectType;
+  const ai = mockBACnetDatabase[T.ANALOG_INPUT];
+  const bv = mockBACnetDatabase[T.BINARY_VALUE];
+  const bo = mockBACnetDatabase[T.BINARY_OUTPUT];
 
-    if (zone3.FLOW !== null) {
-    ai[1][Bacnet.enum.PropertyIdentifier.PRESENT_VALUE][0].value = zone3.FLOW;
-    checkAndNotifyCov({ type: Bacnet.enum.ObjectType.ANALOG_INPUT, instance: 1 }, zone3.FLOW);
+  if (zone3.FLOW !== null) {
+    ai[1][PV][0].value = zone3.FLOW;
+    checkAndNotifyCov({ type: T.ANALOG_INPUT, instance: 1 }, zone3.FLOW);
   }
   if (zone3.MOISTURE !== null) {
-    ai[2][Bacnet.enum.PropertyIdentifier.PRESENT_VALUE][0].value = zone3.MOISTURE;
-    checkAndNotifyCov({ type: Bacnet.enum.ObjectType.ANALOG_INPUT, instance: 2 }, zone3.MOISTURE);
+    ai[2][PV][0].value = zone3.MOISTURE;
+    checkAndNotifyCov({ type: T.ANALOG_INPUT, instance: 2 }, zone3.MOISTURE);
   }
   if (zone3.VALVE !== null) {
-    bv[1][Bacnet.enum.PropertyIdentifier.PRESENT_VALUE][0].value = zone3.VALVE ? 1 : 0;
-    checkAndNotifyCov({ type: Bacnet.enum.ObjectType.BINARY_VALUE, instance: 1 }, zone3.VALVE ? 1 : 0);
+    bv[1][PV][0].value = zone3.VALVE ? 1 : 0;
+    checkAndNotifyCov({ type: T.BINARY_VALUE, instance: 1 }, zone3.VALVE ? 1 : 0);
   }
   if (zone3.FAULT !== null) {
-    bv[2][Bacnet.enum.PropertyIdentifier.PRESENT_VALUE][0].value = zone3.FAULT ? 1 : 0;
-    checkAndNotifyCov({ type: Bacnet.enum.ObjectType.BINARY_VALUE, instance: 2 }, zone3.FAULT ? 1 : 0);
+    bv[2][PV][0].value = zone3.FAULT ? 1 : 0;
+    checkAndNotifyCov({ type: T.BINARY_VALUE, instance: 2 }, zone3.FAULT ? 1 : 0);
   }
-  if (zone3.AUTO !== null && Date.now() > autoHoldUntil) {
-    bo[1][Bacnet.enum.PropertyIdentifier.PRESENT_VALUE][0].value = zone3.AUTO ? 1 : 0;
-    checkAndNotifyCov({ type: Bacnet.enum.ObjectType.BINARY_OUTPUT, instance: 1 }, zone3.AUTO ? 1 : 0);
+
+  let auto = zone3.AUTO;
+  if (auto !== null) {
+    auto = !!auto;
+    if (pendingAuto) {
+      if (auto === pendingAuto.value || Date.now() > pendingAuto.expires) {
+        pendingAuto = null;           // poll confirmed the command, or it never took effect: trust the poll again
+      } else {
+        auto = pendingAuto.value;     // poll still shows the old value: keep the commanded one
+      }
+    }
+    bo[1][PV][0].value = auto ? 1 : 0;
+    checkAndNotifyCov({ type: T.BINARY_OUTPUT, instance: 1 }, auto ? 1 : 0);
   }
-  console.log(`[Zone 03 -> BACnet] flow=${zone3.FLOW} moisture=${zone3.MOISTURE?.toFixed(2)} valve=${zone3.VALVE} fault=${zone3.FAULT} auto=${zone3.AUTO}`);
-  // Fire-and-forget: don't block the sync loop on DB writes, but don't lose errors either
+
+  console.log(`[Zone 03 -> BACnet] flow=${zone3.FLOW} moisture=${zone3.MOISTURE?.toFixed(2)} valve=${zone3.VALVE} fault=${zone3.FAULT} auto=${auto}`);
+
   logToHistorian().catch(err => console.error('[Historian] log failed:', err.message));
 }
 
